@@ -1,5 +1,76 @@
-# Use a slim Python base image
-FROM python:3.15-slim
+# Python version shared by both stages. The venv built in the builder stage
+# links against the base image's interpreter, so both stages MUST use the same tag.
+# 3.15: scikit-image 0.26 and pyclipper are compiled from source in the builder.
+# 3.13: everything installs from prebuilt wheels (faster build).
+ARG PYTHON_VERSION=3.15
+
+# ---------------------------------------------------------------------------
+# Stage 1: builder - compiler toolchain, Python venv, MediaMTX binary.
+# Nothing from this stage ends up in the final image except /opt/venv and mediamtx.
+# ---------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+# gcc/g++ for packages without wheels for this Python version (scikit-image needs C, pyclipper needs C++)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Isolated venv so the runtime stage can copy all Python deps in one step
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install core Python dependencies
+RUN pip install \
+    flask \
+    flask-cors \
+    requests \
+    pyyaml \
+    psutil \
+    onvif-zeep \
+    apprise \
+    paramiko \
+    cryptography \
+    "HAP-python[Camera]" \
+    qrcode
+
+# Install CPU-only PyTorch first (keeps the image small, ~200MB vs ~2GB for GPU)
+RUN pip install \
+    torch \
+    torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Install AI dependencies (ultralytics / YOLO + headless OpenCV + EasyOCR for license plates)
+RUN pip install \
+    ultralytics \
+    opencv-python-headless \
+    easyocr
+
+# Detect host architecture at build time and download the correct MediaMTX v1.21.3.
+# Copied into /app in the runtime stage so MediaMTXManager skips downloading it at runtime.
+WORKDIR /build
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "amd64" ]; then \
+        MEDIAMTX_ARCH="amd64"; \
+    elif [ "$ARCH" = "arm64" ]; then \
+        MEDIAMTX_ARCH="arm64"; \
+    elif [ "$ARCH" = "armhf" ]; then \
+        MEDIAMTX_ARCH="armv7"; \
+    else \
+        MEDIAMTX_ARCH="amd64"; \
+    fi && \
+    curl -fL -o mediamtx.tar.gz "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/mediamtx_v1.21.3_linux_${MEDIAMTX_ARCH}.tar.gz" && \
+    tar -xzf mediamtx.tar.gz mediamtx && \
+    rm mediamtx.tar.gz && \
+    chmod +x mediamtx
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime
+# ---------------------------------------------------------------------------
+FROM python:${PYTHON_VERSION}-slim
 
 # Install system dependencies needed for FFmpeg, macvlan creation, DHCP, and PyTorch (libgomp1)
 RUN apt-get update && apt-get install -y \
@@ -26,50 +97,16 @@ RUN sed -i 's/Components: main/Components: main contrib non-free non-free-firmwa
     (apt-get install -y --no-install-recommends i965-va-driver-shaders || apt-get install -y --no-install-recommends i965-va-driver || true) && \
     rm -rf /var/lib/apt/lists/*
 
+# Python deps from the builder; prepend to PATH so `python` resolves to the venv
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
 WORKDIR /app
 
-# Detect host architecture at build time and download the correct MediaMTX v1.21.3.
-# This places it directly in the working directory so MediaMTXManager skips downloading it at runtime.
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "amd64" ]; then \
-        MEDIAMTX_ARCH="amd64"; \
-    elif [ "$ARCH" = "arm64" ]; then \
-        MEDIAMTX_ARCH="arm64"; \
-    elif [ "$ARCH" = "armhf" ]; then \
-        MEDIAMTX_ARCH="armv7"; \
-    else \
-        MEDIAMTX_ARCH="amd64"; \
-    fi && \
-    curl -L -o mediamtx.tar.gz "https://github.com/bluenviron/mediamtx/releases/download/v1.21.3/mediamtx_v1.21.3_linux_${MEDIAMTX_ARCH}.tar.gz" && \
-    tar -xzf mediamtx.tar.gz mediamtx && \
-    rm mediamtx.tar.gz && \
-    chmod +x mediamtx
+COPY --from=builder /build/mediamtx /app/mediamtx
 
-# Install core Python dependencies
-RUN pip install --no-cache-dir \
-    flask \
-    flask-cors \
-    requests \
-    pyyaml \
-    psutil \
-    onvif-zeep \
-    apprise \
-    paramiko \
-    cryptography \
-    "HAP-python[Camera]" \
-    qrcode
-
-# Install CPU-only PyTorch first (keeps the image small, ~200MB vs ~2GB for GPU)
-RUN pip install --no-cache-dir \
-    torch \
-    torchvision \
-    --index-url https://download.pytorch.org/whl/cpu
-
-# Install AI dependencies (ultralytics / YOLO + headless OpenCV + EasyOCR for license plates)
-RUN pip install --no-cache-dir \
-    ultralytics \
-    opencv-python-headless \
-    easyocr
+# Model pre-downloads run here, not in the builder: importing cv2 (pulled in by
+# ultralytics/easyocr) needs libGL/glib, which only the runtime stage has (via ffmpeg deps).
 
 # Pre-download the default YOLO model so it's available immediately at runtime
 RUN python -c "from ultralytics import YOLO; YOLO('yolov8n.pt')"
