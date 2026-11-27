@@ -32,17 +32,26 @@ jobs:
           echo "name=$(echo ${{ github.event.repository.name }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
           echo "owner=$(echo ${{ github.repository_owner }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
-      - name: Build Docker image
+      - name: Build image (local only)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: ghcr.io/${{ steps.repo.outputs.owner }}/${{ steps.repo.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: bash .github/smoke-test.sh "ghcr.io/${{ steps.repo.outputs.owner }}/${{ steps.repo.outputs.name }}:latest"
+
+      # All layers are cached from the local build, so this only uploads
+      - name: Push image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           push: true
-          load: true
           tags: ghcr.io/${{ steps.repo.outputs.owner }}/${{ steps.repo.outputs.name }}:latest
           cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Run basic image test
-        run: |
-          docker image inspect ghcr.io/${{ steps.repo.outputs.owner }}/${{ steps.repo.outputs.name }}:latest
